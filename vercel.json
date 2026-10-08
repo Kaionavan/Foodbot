@@ -1,0 +1,4 @@
+{
+  "functions": { "api/index.py": { "maxDuration": 30 } },
+  "crons": [{ "path": "/api/index", "schedule": "5 16 * * *" }]
+}
