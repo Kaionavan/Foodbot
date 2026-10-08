@@ -1,4 +1,4 @@
-"""Telegram bot: заказ еды + заявки. Версия для Vercel (вебхук + Upstash Redis)."""
+
 import asyncio
 import contextvars
 import hashlib
@@ -21,15 +21,15 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message, Update
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ---------- config (всё через env) ----------
-TOKEN = os.environ.get("BOT_TOKEN", "")
+TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 CARD_INFO = os.environ.get("CARD_INFO", "Карта: 0000 0000 0000 0000\nПолучатель: Имя Ф.")
 OPEN_H = int(os.environ.get("OPEN_HOUR", 16))    # меню открывается
 CLOSE_H = int(os.environ.get("CLOSE_HOUR", 21))  # приём заказов закрывается
-CRON_SECRET = os.environ.get("CRON_SECRET", "")
+CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]  # защита вебхука
-KV_URL = os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL") or ""
-KV_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN") or ""
+KV_URL = (os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
+KV_TOKEN = (os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 TZ = timezone(timedelta(hours=5))  # Ташкент, UTC+5, без перехода на летнее время
 
 logging.basicConfig(level=logging.INFO)
@@ -659,6 +659,8 @@ async def cron_job():
 
 
 async def setup_webhook(host):
+    prod = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "").strip()
+    host = prod or host
     bot = Bot(TOKEN)
     try:
         url = f"https://{host}/api/index"
@@ -666,6 +668,55 @@ async def setup_webhook(host):
         return f"OK. Вебхук установлен: {url}"
     finally:
         await bot.session.close()
+
+
+async def notify_error(text):
+    """Если что-то сломалось, бот пишет об этом админу."""
+    if not TOKEN or not ADMIN_IDS:
+        return
+    bot = Bot(TOKEN)
+    try:
+        for a in ADMIN_IDS:
+            await bot.send_message(a, ("⚠️ Ошибка бота:\n" + text)[:900])
+    except Exception:
+        logging.exception("notify_error failed")
+    finally:
+        await bot.session.close()
+
+
+async def info():
+    """Диагностика: что настроено и что видит Telegram."""
+    out = [
+        f"BOT_TOKEN: {'есть' if TOKEN else 'НЕТ'}",
+        f"ADMIN_IDS: {len(ADMIN_IDS)} шт." if ADMIN_IDS else "ADMIN_IDS: НЕТ",
+        f"Redis URL: {'есть' if KV_URL else 'НЕТ'}",
+        f"Redis token: {'есть' if KV_TOKEN else 'НЕТ'}",
+        f"CARD_INFO: {'задана' if 'CARD_INFO' in os.environ else 'НЕТ (стоит заглушка)'}",
+        f"Часы приёма: {OPEN_H}:00-{CLOSE_H}:00, сейчас в Ташкенте {now().strftime('%H:%M')} ({phase()})",
+        f"Домен проекта: {os.environ.get('VERCEL_PROJECT_PRODUCTION_URL', 'не известен')}",
+    ]
+    async with aiohttp.ClientSession() as s:
+        _sess.set(s)
+        _cache.set({})
+        try:
+            out.append(f"Redis PING: {await kv('PING')}")
+        except Exception as e:
+            out.append(f"Redis ОШИБКА: {type(e).__name__}: {e}")
+    if TOKEN:
+        bot = Bot(TOKEN)
+        try:
+            me = await bot.get_me()
+            out.append(f"Бот: @{me.username}")
+            wi = await bot.get_webhook_info()
+            out.append(f"Вебхук: {wi.url or 'НЕ УСТАНОВЛЕН'}")
+            out.append(f"Ждут доставки: {wi.pending_update_count}")
+            if wi.last_error_message:
+                out.append(f"Последняя ошибка Telegram: {wi.last_error_message}")
+        except Exception as e:
+            out.append(f"Telegram ОШИБКА: {type(e).__name__}: {e}")
+        finally:
+            await bot.session.close()
+    return "\n".join(out)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -684,8 +735,12 @@ class handler(BaseHTTPRequestHandler):
             return self._reply(403, "forbidden")
         try:
             asyncio.run(handle_update(json.loads(body)))
-        except Exception:
+        except Exception as e:
             logging.exception("update failed")
+            try:
+                asyncio.run(notify_error(f"{type(e).__name__}: {e}"))
+            except Exception:
+                pass
         self._reply(200, "ok")  # всегда 200, чтобы Telegram не слал повторы
 
     def do_GET(self):
@@ -693,6 +748,8 @@ class handler(BaseHTTPRequestHandler):
         task = qs.get("task", [""])[0]
         ua = self.headers.get("user-agent", "")
         try:
+            if task == "info":
+                return self._reply(200, asyncio.run(info()))
             if task == "setup":
                 return self._reply(200, asyncio.run(setup_webhook(self.headers.get("host"))))
             if task == "cron" or ua.startswith("vercel-cron"):
