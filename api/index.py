@@ -1,4 +1,4 @@
-
+"""Telegram bot: заказ еды + заявки. Версия для Vercel (вебхук + Upstash Redis)."""
 import asyncio
 import contextvars
 import hashlib
@@ -22,10 +22,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ---------- config (всё через env) ----------
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
+def _int_env(name, default):
+    m = re.search(r"\d+", os.environ.get(name, ""))
+    return int(m.group()) if m else default
+
+
+# берём из значения только цифры, чтобы лишние буквы/пробелы не ломали запуск
+ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
 CARD_INFO = os.environ.get("CARD_INFO", "Карта: 0000 0000 0000 0000\nПолучатель: Имя Ф.")
-OPEN_H = int(os.environ.get("OPEN_HOUR", 16))    # меню открывается
-CLOSE_H = int(os.environ.get("CLOSE_HOUR", 21))  # приём заказов закрывается
+OPEN_H = _int_env("OPEN_HOUR", 16)    # меню открывается
+CLOSE_H = _int_env("CLOSE_HOUR", 21)  # приём заказов закрывается
 CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]  # защита вебхука
 KV_URL = (os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
@@ -183,6 +189,7 @@ TX = {
         "paid": "Оплата подтверждена ✅ Заказ #{id} на завтра в силе.",
         "rejected": "Оплату по заказу #{id} не удалось подтвердить ❌ Напишите в поддержку.",
         "ask_req": "Опишите, что нужно (тема, срок, пожелания). Можно приложить файлы или фото:",
+        "ask_sup": "В чём проблема? Опишите своими словами, можно приложить скрин:",
         "req_sent": "Отправили, скоро свяжемся ✅",
         "restart": "Нажмите «Еда» заново 🙂",
     },
@@ -207,6 +214,7 @@ TX = {
         "paid": "To'lov tasdiqlandi ✅ #{id} buyurtma ertaga uchun kuchda.",
         "rejected": "#{id} buyurtma to'lovini tasdiqlab bo'lmadi ❌ Yordamga yozing.",
         "ask_req": "Nima kerakligini yozing (mavzu, muddat, istaklar). Fayl yoki rasm ham yuborishingiz mumkin:",
+        "ask_sup": "Muammo nimada? O'zingiz yozib bering, skrin ham yuborishingiz mumkin:",
         "req_sent": "Yuborildi, tez orada bog'lanamiz ✅",
         "restart": "«Ovqat» tugmasini qayta bosing 🙂",
     },
@@ -289,6 +297,7 @@ class Req(StatesGroup):
 
 class Adm(StatesGroup):
     menu = State()
+    markup = State()
 
 
 r = Router()
@@ -327,13 +336,115 @@ async def send_long(bot, chat_id, text):
 
 
 # ---------- start / language ----------
-@r.message(CommandStart())
-async def start(m: Message, state: FSMContext):
-    await state.clear()
+def admin_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Загрузить меню на завтра", callback_data="a:menu")
+    kb.button(text="🍽 Какое меню сохранено", callback_data="a:showmenu")
+    kb.button(text="💰 Изменить наценку", callback_data="a:markup")
+    kb.button(text="📦 Заказы на завтра", callback_data="a:orders")
+    kb.button(text="📖 Как пользоваться", callback_data="a:help")
+    kb.button(text="👤 Посмотреть как клиент", callback_data="a:client")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def admin_text():
+    day = target_day()
+    menu = await get_menu(day)
+    menu_line = f"{len(menu)} блюд" if menu else "не загружено"
+    return (
+        f"🛠 Панель админа\n\n"
+        f"Меню на {day}: {menu_line}\n"
+        f"Наценка: {await get_setting('markup', '10')}%\n"
+        f"Приём заказов: {OPEN_H}:00–{CLOSE_H}:00 (Ташкент)"
+    )
+
+
+def help_text():
+    return (
+        "📖 Как пользоваться\n\n"
+        f"1. Каждый день до {OPEN_H}:00 нажми «Загрузить меню на завтра»\n"
+        "2. Пересылай боту посты из канала: фото + подпись «Блюдо — цена». Каждое блюдо отдельным постом\n"
+        "3. Когда всё скинул, отправь /done. Бот добавит наценку и сохранит меню\n"
+        f"4. С {OPEN_H}:00 клиенты видят меню, заказы принимаются до {CLOSE_H}:00\n"
+        "5. Приходит заказ с чеком: проверь оплату и нажми «✅ Оплата ок» или «❌ Отклонить». Клиент получит уведомление\n"
+        f"6. После {CLOSE_H}:00 нажми «Заказы на завтра»: список для ресторана и по людям. Он также приходит сам раз в день\n\n"
+        "Заявки на отработку, презентацию, статью и поддержку приходят сюда со ссылкой на клиента.\n"
+        "Вернуться в панель: /start. Отмена любого действия: /start."
+    )
+
+
+async def ask_language(msg: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🇷🇺 Русский", callback_data="lang:ru")
     kb.button(text="🇺🇿 O'zbekcha", callback_data="lang:uz")
-    await m.answer("Выберите язык / Tilni tanlang", reply_markup=kb.as_markup())
+    await msg.answer("Выберите язык / Tilni tanlang", reply_markup=kb.as_markup())
+
+
+async def start_menu_upload(msg: Message, state: FSMContext):
+    await state.set_state(Adm.menu)
+    await state.update_data(items=[])
+    await msg.answer(
+        "Пересылай посты из канала (фото + подпись «Блюдо — цена», каждое блюдо отдельным постом).\n"
+        f"Наценка сейчас {await get_setting('markup', '10')}%. Меню будет на {target_day()}.\n"
+        "Когда всё скинул — /done. Отмена — /start."
+    )
+
+
+@r.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    if m.from_user.id in ADMIN_IDS:
+        return await m.answer(await admin_text(), reply_markup=admin_kb())
+    await ask_language(m)
+
+
+@r.message(Command("admin"), is_admin)
+async def admin_panel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(await admin_text(), reply_markup=admin_kb())
+
+
+@r.callback_query(F.data.startswith("a:"), is_admin)
+async def admin_action(c: CallbackQuery, state: FSMContext, bot: Bot):
+    act = c.data.split(":")[1]
+    await c.answer()
+    if act == "menu":
+        await start_menu_upload(c.message, state)
+    elif act == "showmenu":
+        menu = await get_menu(target_day())
+        if not menu:
+            await c.message.answer("Меню на завтра ещё не загружено.", reply_markup=admin_kb())
+        else:
+            lines = "\n".join(f"• {i['n']} — {fmt(i['p'])}" for i in menu)
+            await c.message.answer(f"Меню на {target_day()} (с наценкой):\n{lines}", reply_markup=admin_kb())
+    elif act == "markup":
+        await state.set_state(Adm.markup)
+        await c.message.answer(
+            f"Наценка сейчас {await get_setting('markup', '10')}%.\n"
+            "Напиши новое число в процентах, например 15. Отмена — /start."
+        )
+    elif act == "orders":
+        await send_long(bot, c.from_user.id, await build_summary(target_day()))
+    elif act == "help":
+        await c.message.answer(help_text(), reply_markup=admin_kb())
+    elif act == "client":
+        await ask_language(c.message)
+
+
+@r.message(Adm.markup, F.text, is_admin)
+async def adm_markup_value(m: Message, state: FSMContext):
+    try:
+        pct = float(m.text.strip().replace(",", ".").replace("%", ""))
+        assert 0 <= pct <= 300
+    except (ValueError, AssertionError):
+        return await m.answer("Нужно число от 0 до 300, например 15. Или /start для отмены.")
+    await set_setting("markup", pct)
+    await state.clear()
+    await m.answer(
+        f"✅ Наценка {pct}%. Она применится к меню, которое загрузишь дальше.",
+        reply_markup=admin_kb(),
+    )
 
 
 @r.callback_query(F.data.startswith("lang:"))
@@ -347,13 +458,7 @@ async def set_lang(c: CallbackQuery):
 # ---------- admin ----------
 @r.message(Command("menu"), is_admin)
 async def adm_menu(m: Message, state: FSMContext):
-    await state.set_state(Adm.menu)
-    await state.update_data(items=[])
-    await m.answer(
-        f"Пересылай посты из канала (фото + подпись «Блюдо — цена», каждое блюдо отдельным постом).\n"
-        f"Наценка сейчас {await get_setting('markup', '10')}%. Меню будет на {target_day()}.\n"
-        f"Когда всё скинул — /done. Отмена — /start."
-    )
+    await start_menu_upload(m, state)
 
 
 @r.message(Command("markup"), is_admin)
@@ -393,7 +498,8 @@ async def adm_menu_done(m: Message, state: FSMContext):
     prev = "\n".join(f"• {i['n']} — {fmt(i['p'])}" for i in final)
     await m.answer(
         f"✅ Меню на {day} сохранено (наценка {pct}%):\n{prev}\n\n"
-        f"Клиенты увидят его с {OPEN_H}:00, заказы до {CLOSE_H}:00."
+        f"Клиенты увидят его с {OPEN_H}:00, заказы до {CLOSE_H}:00.",
+        reply_markup=admin_kb(),
     )
 
 
@@ -442,7 +548,7 @@ async def req_start(c: CallbackQuery, state: FSMContext):
     kind = c.data.split(":")[1]
     await state.set_state(Req.text)
     await state.update_data(kind=t(lang, kind))
-    await c.message.answer(t(lang, "ask_req"))
+    await c.message.answer(t(lang, "ask_sup" if kind == "sup" else "ask_req"))
     await c.answer()
 
 
